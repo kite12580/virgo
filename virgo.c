@@ -18,7 +18,12 @@
 #define MOD_NOREPEAT 0x4000
 #endif
 
-#define NUM_DESKTOPS 4
+#define NUM_DESKTOPS 2
+#define WM_TRAYICON (WM_APP + 1)
+#define ID_EXIT 1
+#define ID_HOTKEYS 2
+#define ID_SWITCH 3
+#define ID_MOVE (ID_SWITCH + NUM_DESKTOPS)
 
 typedef struct {
 	HWND *windows;
@@ -37,9 +42,17 @@ typedef struct {
 typedef struct {
 	unsigned current;
 	unsigned handle_hotkeys;
+	unsigned taskbar_created;
+	HWND active[NUM_DESKTOPS];
+	HWINEVENTHOOK hook;
 	Windows desktops[NUM_DESKTOPS];
 	Trayicon trayicon;
 } Virgo;
+
+static Virgo virgo;
+
+static const COLORREF desktop_colors[NUM_DESKTOPS] = {RGB(0x00, 0xFF, 0x00),
+													  RGB(0xFF, 0x80, 0x00)};
 
 static void *stb__sbgrowf(void *arr, unsigned increment, unsigned itemsize)
 {
@@ -65,54 +78,58 @@ static void *stb__sbgrowf(void *arr, unsigned increment, unsigned itemsize)
 	}
 }
 
-static HICON trayicon_draw(Trayicon *t, char *text, unsigned len)
+static void trayicon_draw(Trayicon *t, unsigned number, COLORREF color)
 {
+	char text[11];
+	unsigned len;
 	ICONINFO iconInfo;
 	HBITMAP hOldBitmap;
 	HFONT hOldFont;
+	len = wsprintfA(text, "%u", number);
 	hOldBitmap = (HBITMAP)SelectObject(t->mdc, t->hBitmap);
 	hOldFont = (HFONT)SelectObject(t->mdc, t->hFont);
+	SetTextColor(t->mdc, color);
 	TextOut(t->mdc, t->bitmapWidth / 4, 0, text, len);
 	SelectObject(t->mdc, hOldBitmap);
 	SelectObject(t->mdc, hOldFont);
 	iconInfo.fIcon = TRUE;
 	iconInfo.xHotspot = iconInfo.yHotspot = 0;
 	iconInfo.hbmMask = iconInfo.hbmColor = t->hBitmap;
-	return CreateIconIndirect(&iconInfo);
+	DestroyIcon(t->nid.hIcon);
+	t->nid.hIcon = CreateIconIndirect(&iconInfo);
+	wsprintfA(t->nid.szTip, "Desktop %u", number);
 }
 
-static void trayicon_init(Trayicon *t)
+static void trayicon_init(Trayicon *t, WNDPROC proc, COLORREF color)
 {
 	HDC hdc;
-	t->hwnd =
-		CreateWindowA("STATIC", "virgo", 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL);
+	WNDCLASSA wc = {0};
+	wc.lpfnWndProc = proc;
+	wc.hInstance = GetModuleHandleA(NULL);
+	wc.lpszClassName = "virgo";
+	RegisterClassA(&wc);
+	t->hwnd = CreateWindowA("virgo", "virgo", 0, 0, 0, 0, 0, NULL, NULL,
+							wc.hInstance, NULL);
 	t->bitmapWidth = GetSystemMetrics(SM_CXSMICON);
 	t->nid.cbSize = sizeof(t->nid);
 	t->nid.hWnd = t->hwnd;
 	t->nid.uID = 100;
-	t->nid.uFlags = NIF_ICON;
+	t->nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+	t->nid.uCallbackMessage = WM_TRAYICON;
 	hdc = GetDC(t->hwnd);
 	t->hBitmap = CreateCompatibleBitmap(hdc, t->bitmapWidth, t->bitmapWidth);
 	t->mdc = CreateCompatibleDC(hdc);
 	ReleaseDC(t->hwnd, hdc);
 	SetBkColor(t->mdc, RGB(0x00, 0x00, 0x00));
-	SetTextColor(t->mdc, RGB(0x00, 0xFF, 0x00));
 	t->hFont = CreateFont(-MulDiv(11, GetDeviceCaps(t->mdc, LOGPIXELSY), 72), 0,
 						  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, TEXT("Arial"));
-	t->nid.hIcon = trayicon_draw(t, "1", 1);
+	trayicon_draw(t, 1, color);
 	Shell_NotifyIcon(NIM_ADD, &t->nid);
 }
 
-static void trayicon_set(Trayicon *t, unsigned number)
+static void trayicon_set(Trayicon *t, unsigned number, COLORREF color)
 {
-	char snumber[2];
-	if (number > 9) {
-		return;
-	}
-	snumber[0] = number + '0';
-	snumber[1] = 0;
-	DestroyIcon(t->nid.hIcon);
-	t->nid.hIcon = trayicon_draw(t, snumber, 1);
+	trayicon_draw(t, number, color);
 	Shell_NotifyIcon(NIM_MODIFY, &t->nid);
 }
 
@@ -169,13 +186,13 @@ static unsigned is_valid_window(HWND hwnd)
 {
 	WINDOWINFO wi;
 	wi.cbSize = sizeof(wi);
-	GetWindowInfo(hwnd, &wi);
-	return (wi.dwStyle & WS_VISIBLE) && !(wi.dwExStyle & WS_EX_TOOLWINDOW);
+	return GetWindowInfo(hwnd, &wi) && (wi.dwStyle & WS_VISIBLE) &&
+		   !(wi.dwExStyle & WS_EX_TOOLWINDOW);
 }
 
-static void register_hotkey(unsigned id, unsigned mod, unsigned vk)
+static void register_hotkey(HWND hwnd, unsigned id, unsigned mod, unsigned vk)
 {
-	if (!RegisterHotKey(NULL, id, mod, vk)) {
+	if (!RegisterHotKey(hwnd, id, mod, vk)) {
 		MessageBox(NULL, "could not register hotkey", "error",
 				   MB_ICONEXCLAMATION);
 		ExitProcess(1);
@@ -227,57 +244,33 @@ static void virgo_update(Virgo *v)
 	EnumWindows((WNDENUMPROC)&enum_func, (LPARAM)v);
 }
 
+static void CALLBACK virgo_foreground(HWINEVENTHOOK hook, DWORD event,
+									  HWND hwnd, LONG idObject, LONG idChild,
+									  DWORD idEventThread, DWORD dwmsEventTime)
+{
+	if (is_valid_window(hwnd)) {
+		virgo.active[virgo.current] = hwnd;
+	}
+}
+
 static void virgo_toggle_hotkeys(Virgo *v)
 {
-	unsigned i;
 	v->handle_hotkeys = !v->handle_hotkeys;
 	if (v->handle_hotkeys) {
-		for (i = 0; i < NUM_DESKTOPS; i++) {
-			register_hotkey(i * 2, MOD_ALT | MOD_NOREPEAT, i + 1 + '0');
-			register_hotkey(i * 2 + 1, MOD_CONTROL | MOD_NOREPEAT, i + 1 + '0');
-		}
+		register_hotkey(v->trayicon.hwnd, 0, MOD_WIN | MOD_NOREPEAT, VK_OEM_3);
 	} else {
-		for (i = 0; i < NUM_DESKTOPS; i++) {
-			UnregisterHotKey(NULL, i * 2);
-			UnregisterHotKey(NULL, i * 2 + 1);
-		}
+		UnregisterHotKey(v->trayicon.hwnd, 0);
 	}
-}
-
-static void virgo_init(Virgo *v)
-{
-	unsigned i;
-	v->handle_hotkeys = 1;
-	for (i = 0; i < NUM_DESKTOPS; i++) {
-		register_hotkey(i * 2, MOD_ALT | MOD_NOREPEAT, i + 1 + '0');
-		register_hotkey(i * 2 + 1, MOD_CONTROL | MOD_NOREPEAT, i + 1 + '0');
-	}
-	register_hotkey(i * 2, MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-					'Q');
-	register_hotkey(i * 2 + 1, MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-					'S');
-	trayicon_init(&v->trayicon);
-}
-
-static void virgo_deinit(Virgo *v)
-{
-	unsigned i;
-	for (i = 0; i < NUM_DESKTOPS; i++) {
-		windows_show(&v->desktops[i]);
-		sb_free(v->desktops[i].windows);
-	}
-	trayicon_deinit(&v->trayicon);
 }
 
 static void virgo_move_to_desk(Virgo *v, unsigned desk)
 {
-	HWND hwnd;
+	HWND hwnd = v->active[v->current];
 	if (v->current == desk) {
 		return;
 	}
 	virgo_update(v);
-	hwnd = GetForegroundWindow();
-	if (!hwnd || !is_valid_window(hwnd)) {
+	if (!is_valid_window(hwnd)) {
 		return;
 	}
 	windows_del(&v->desktops[v->current], hwnd);
@@ -294,30 +287,134 @@ static void virgo_go_to_desk(Virgo *v, unsigned desk)
 	windows_hide(&v->desktops[v->current]);
 	windows_show(&v->desktops[desk]);
 	v->current = desk;
-	trayicon_set(&v->trayicon, v->current + 1);
+	if (is_valid_window(v->active[desk])) {
+		SetForegroundWindow(v->active[desk]);
+	}
+	trayicon_set(&v->trayicon, desk + 1, desktop_colors[desk]);
+}
+
+static void virgo_show_all(Virgo *v)
+{
+	unsigned i;
+	for (i = 0; i < NUM_DESKTOPS; i++) {
+		windows_show(&v->desktops[i]);
+	}
+}
+
+static void virgo_hide_others(Virgo *v)
+{
+	unsigned i;
+	for (i = 0; i < NUM_DESKTOPS; i++) {
+		if (i != v->current) {
+			windows_hide(&v->desktops[i]);
+		}
+	}
+}
+
+static void virgo_next_desk(Virgo *v)
+{
+	virgo_go_to_desk(v, (v->current + 1) % NUM_DESKTOPS);
+}
+
+static void virgo_menu(Virgo *v)
+{
+	char label[64];
+	POINT pt;
+	HMENU menu;
+	unsigned i, cmd, flags;
+	menu = CreatePopupMenu();
+	for (i = 0; i < NUM_DESKTOPS; i++) {
+		wsprintfA(label, "Switch to desktop %u", i + 1);
+		flags = i == v->current ? MF_GRAYED : MF_STRING;
+		AppendMenuA(menu, flags, ID_SWITCH + i, label);
+	}
+	AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+	for (i = 0; i < NUM_DESKTOPS; i++) {
+		wsprintfA(label, "Move active window to desktop %u", i + 1);
+		flags = i == v->current ? MF_GRAYED : MF_STRING;
+		AppendMenuA(menu, flags, ID_MOVE + i, label);
+	}
+	AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+	AppendMenuA(menu, v->handle_hotkeys ? MF_CHECKED : MF_UNCHECKED,
+				ID_HOTKEYS, "Handle hotkeys");
+	AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+	AppendMenuA(menu, MF_STRING, ID_EXIT, "Exit");
+	GetCursorPos(&pt);
+	SetForegroundWindow(v->trayicon.hwnd);
+	cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0,
+						 v->trayicon.hwnd, NULL);
+	DestroyMenu(menu);
+	if (cmd == ID_EXIT) {
+		PostQuitMessage(0);
+	} else if (cmd == ID_HOTKEYS) {
+		virgo_toggle_hotkeys(v);
+	} else if (cmd >= ID_MOVE) {
+		virgo_move_to_desk(v, cmd - ID_MOVE);
+	} else if (cmd >= ID_SWITCH) {
+		virgo_go_to_desk(v, cmd - ID_SWITCH);
+	}
+}
+
+static LRESULT CALLBACK virgo_proc(HWND hwnd, UINT msg, WPARAM wParam,
+								   LPARAM lParam)
+{
+	if (msg == WM_HOTKEY) {
+		virgo_next_desk(&virgo);
+		return 0;
+	}
+	if (msg == WM_TRAYICON) {
+		if (lParam == WM_LBUTTONUP) {
+			virgo_next_desk(&virgo);
+		} else if (lParam == WM_RBUTTONUP) {
+			virgo_menu(&virgo);
+		}
+		return 0;
+	}
+	if (msg == WM_QUERYENDSESSION) {
+		virgo_show_all(&virgo);
+		return TRUE;
+	}
+	if (msg == WM_ENDSESSION && !wParam) {
+		virgo_hide_others(&virgo);
+		return 0;
+	}
+	if (msg == virgo.taskbar_created) {
+		Shell_NotifyIcon(NIM_ADD, &virgo.trayicon.nid);
+		return 0;
+	}
+	return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static void virgo_init(Virgo *v)
+{
+	v->active[0] = GetForegroundWindow();
+	v->hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+							  NULL, virgo_foreground, 0, 0,
+							  WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+	v->taskbar_created = RegisterWindowMessageA("TaskbarCreated");
+	trayicon_init(&v->trayicon, virgo_proc, desktop_colors[0]);
+	virgo_toggle_hotkeys(v);
+}
+
+static void virgo_deinit(Virgo *v)
+{
+	unsigned i;
+	UnhookWinEvent(v->hook);
+	virgo_show_all(v);
+	for (i = 0; i < NUM_DESKTOPS; i++) {
+		sb_free(v->desktops[i].windows);
+	}
+	trayicon_deinit(&v->trayicon);
 }
 
 void __main(void) __asm__("__main");
 void __main(void)
 {
-	Virgo v = {0};
 	MSG msg;
-	virgo_init(&v);
+	virgo_init(&virgo);
 	while (GetMessage(&msg, NULL, 0, 0)) {
-		if (msg.message != WM_HOTKEY) {
-			continue;
-		}
-		if (msg.wParam == NUM_DESKTOPS * 2) {
-			break;
-		}
-		if (msg.wParam == NUM_DESKTOPS * 2 + 1) {
-			virgo_toggle_hotkeys(&v);
-		} else if (msg.wParam % 2 == 0) {
-			virgo_go_to_desk(&v, msg.wParam / 2);
-		} else {
-			virgo_move_to_desk(&v, (msg.wParam - 1) / 2);
-		}
+		DispatchMessage(&msg);
 	}
-	virgo_deinit(&v);
+	virgo_deinit(&virgo);
 	ExitProcess(0);
 }
