@@ -5,7 +5,7 @@ Virtual Desktop Manager for Windows
 [Download here](https://github.com/kite12580/virgo/releases/latest/download/virgo.zip)
 
 Features:
-- resource friendly, exe is <10kb on disk and uses <1mb memory while running
+- resource friendly, exe is <12kb on disk and uses <1mb memory while running
 - 2 virtual desktops
 - shows only a tray icon with the number of the desktop you are on, in a
   different color per desktop
