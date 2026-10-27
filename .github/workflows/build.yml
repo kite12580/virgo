@@ -24,7 +24,7 @@ jobs:
           suppress-deprecation-warnings: msystem-mingw32
       - run: make CC=gcc
       - run: zip virgo.zip virgo.exe
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: virgo
           path: virgo.exe
