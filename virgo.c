@@ -257,7 +257,7 @@ static void virgo_toggle_hotkeys(Virgo *v)
 {
 	v->handle_hotkeys = !v->handle_hotkeys;
 	if (v->handle_hotkeys) {
-		register_hotkey(v->trayicon.hwnd, 0, MOD_WIN | MOD_NOREPEAT, VK_OEM_3);
+		register_hotkey(v->trayicon.hwnd, 0, MOD_WIN | MOD_NOREPEAT, VK_ESCAPE);
 	} else {
 		UnregisterHotKey(v->trayicon.hwnd, 0);
 	}
